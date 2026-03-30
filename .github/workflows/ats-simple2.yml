@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server v2
+name: Build Apache Traffic Server
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
 
       - name: Clone Repository
         run: |
-          # Clones from your fork using the branch selected in the GitHub UI
+          # Clones from your fork using the branch selected in the 'Use workflow from' dropdown
           git clone https://github.com/mkrug1981/trafficserver.git
           cd trafficserver
           git checkout ${{ github.ref_name }}
@@ -60,20 +60,34 @@ jobs:
             automake libtool libmaxminddb-devel luajit-devel jansson-devel \
             brotli-devel
 
-      - name: Build and Install
+      - name: Configure ATS with CMake (Full Feature List)
         run: |
           cd trafficserver
           cmake -B build-release \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/opt/trafficserver \
             -DENABLE_EXPERIMENTAL_PLUGINS=ON \
+            -DENABLE_HWLOC=ON \
+            -DENABLE_SYSTEM_STATS=ON \
+            -DENABLE_RATE_LIMIT=ON \
+            -DENABLE_REDO_CACHE_LOOKUP=ON \
+            -DENABLE_MONEY_TRACE=ON \
+            -DENABLE_MAXMIND_ACL=ON \
+            -DENABLE_HTTP_STATS=ON \
+            -DENABLE_FQ_PACING=ON \
+            -DENABLE_ACCESS_CONTROL=ON \
+            -DENABLE_BLOCK_ERRORS=ON \
+            -DENABLE_TXN_BOX=ON \
             -GNinja
+
+      - name: Build and Install
+        run: |
+          cd trafficserver
           cmake --build build-release -j$(nproc)
           cmake --build build-release --target install
 
       - name: Create Systemd Unit File
         run: |
-          # This unit file supports: start, stop, restart, status, and reload
           cat <<EOF > trafficserver.service
           [Unit]
           Description=Apache Traffic Server
@@ -83,9 +97,7 @@ jobs:
           Type=simple
           Environment="TS_ROOT=/opt/trafficserver"
           ExecStart=/opt/trafficserver/bin/traffic_server
-          # Reload triggers a config refresh via traffic_ctl
           ExecReload=/opt/trafficserver/bin/traffic_ctl config reload
-          # Proper stop handling
           ExecStop=/opt/trafficserver/bin/traffic_server stop
           Restart=on-failure
           RestartSec=5s
@@ -98,10 +110,7 @@ jobs:
 
       - name: Package RPM
         run: |
-          # Install FPM to handle RPM creation
           gem install --no-document fpm
-          
-          # Get version from the newly built binary
           VERSION=$(/opt/trafficserver/bin/traffic_server --version | head -n1 | awk '{print $4}')
           
           fpm -s dir -t rpm \
@@ -109,7 +118,7 @@ jobs:
             --version "$VERSION" \
             --iteration "1.el${{ matrix.rocky_version }}" \
             --architecture x86_64 \
-            --description "Apache Traffic Server for Rocky Linux ${{ matrix.rocky_version }} with Systemd support" \
+            --description "Apache Traffic Server with full experimental features and Systemd support" \
             --package "trafficserver-${VERSION}-rocky${{ matrix.rocky_version }}.rpm" \
             /opt/trafficserver \
             trafficserver.service=/usr/lib/systemd/system/trafficserver.service

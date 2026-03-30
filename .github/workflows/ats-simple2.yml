@@ -1,0 +1,121 @@
+name: Build Apache Traffic Server v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocky_versions:
+        description: 'Rocky Linux versions (comma-separated: 8,9,10)'
+        required: true
+        default: '8,9,10'
+        type: string
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      rocky_versions: ${{ steps.set-rocky.outputs.rocky_versions }}
+    steps:
+      - name: Parse Rocky Versions
+        id: set-rocky
+        run: |
+          ROCKY_VERSIONS='${{ github.event.inputs.rocky_versions }}'
+          ROCKY_JSON=$(echo $ROCKY_VERSIONS | jq -R -c 'split(",") | map(gsub("^\\s+|\\s+$";""))')
+          echo "rocky_versions=$ROCKY_JSON" >> $GITHUB_OUTPUT
+
+  build-ats:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        rocky_version: ${{ fromJson(needs.prepare-matrix.outputs.rocky_versions) }}
+    
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:${{ matrix.rocky_version }}
+    
+    steps:
+      - name: Install Base Tools
+        run: |
+          dnf install -y git wget jq rpm-build ruby-devel gcc make
+
+      - name: Clone Repository
+        run: |
+          # Clones from your fork using the branch selected in the GitHub UI
+          git clone https://github.com/mkrug1981/trafficserver.git
+          cd trafficserver
+          git checkout ${{ github.ref_name }}
+          echo "Building ref: ${{ github.ref_name }}"
+
+      - name: Install Build Dependencies
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null || true
+          dnf groupinstall -y "Development Tools"
+          dnf install -y \
+            gcc gcc-c++ cmake ninja-build make pkgconfig openssl-devel \
+            pcre-devel pcre2-devel libcap-devel hwloc-devel libcurl-devel \
+            ncurses-devel tcl-devel expat-devel perl-ExtUtils-MakeMaker \
+            flex bison zlib-devel libxml2-devel libunwind-devel \
+            libyaml-devel python3 python3-pip python3-devel autoconf \
+            automake libtool libmaxminddb-devel luajit-devel jansson-devel \
+            brotli-devel
+
+      - name: Build and Install
+        run: |
+          cd trafficserver
+          cmake -B build-release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/trafficserver \
+            -DENABLE_EXPERIMENTAL_PLUGINS=ON \
+            -GNinja
+          cmake --build build-release -j$(nproc)
+          cmake --build build-release --target install
+
+      - name: Create Systemd Unit File
+        run: |
+          # This unit file supports: start, stop, restart, status, and reload
+          cat <<EOF > trafficserver.service
+          [Unit]
+          Description=Apache Traffic Server
+          After=network.target remote-fs.target nss-lookup.target
+
+          [Service]
+          Type=simple
+          Environment="TS_ROOT=/opt/trafficserver"
+          ExecStart=/opt/trafficserver/bin/traffic_server
+          # Reload triggers a config refresh via traffic_ctl
+          ExecReload=/opt/trafficserver/bin/traffic_ctl config reload
+          # Proper stop handling
+          ExecStop=/opt/trafficserver/bin/traffic_server stop
+          Restart=on-failure
+          RestartSec=5s
+          KillMode=process
+          LimitNOFILE=1000000
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+      - name: Package RPM
+        run: |
+          # Install FPM to handle RPM creation
+          gem install --no-document fpm
+          
+          # Get version from the newly built binary
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version | head -n1 | awk '{print $4}')
+          
+          fpm -s dir -t rpm \
+            --name "trafficserver" \
+            --version "$VERSION" \
+            --iteration "1.el${{ matrix.rocky_version }}" \
+            --architecture x86_64 \
+            --description "Apache Traffic Server for Rocky Linux ${{ matrix.rocky_version }} with Systemd support" \
+            --package "trafficserver-${VERSION}-rocky${{ matrix.rocky_version }}.rpm" \
+            /opt/trafficserver \
+            trafficserver.service=/usr/lib/systemd/system/trafficserver.service
+
+      - name: Upload RPM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ats-rpm-rocky${{ matrix.rocky_version }}
+          path: "*.rpm"

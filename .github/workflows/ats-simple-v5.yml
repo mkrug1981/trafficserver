@@ -1,1 +1,161 @@
+name: Build Apache Traffic Server v4
 
+on:
+  workflow_dispatch:
+    inputs:
+      rocky_versions:
+        description: 'Rocky Linux versions (comma-separated: 8,9,10)'
+        required: true
+        default: '8,9,10'
+        type: string
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      rocky_versions: ${{ steps.set-rocky.outputs.rocky_versions }}
+    steps:
+      - name: Parse Rocky Versions
+        id: set-rocky
+        run: |
+          ROCKY_VERSIONS='${{ github.event.inputs.rocky_versions }}'
+          ROCKY_JSON=$(echo $ROCKY_VERSIONS | jq -R -c 'split(",") | map(gsub("^\\s+|\\s+$";""))')
+          echo "rocky_versions=$ROCKY_JSON" >> $GITHUB_OUTPUT
+
+  build-ats:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        rocky_version: ${{ fromJson(needs.prepare-matrix.outputs.rocky_versions) }}
+    
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux/rockylinux:${{ matrix.rocky_version }}
+    
+    steps:
+      - name: Install Base Tools
+        run: |
+          # Rocky 8: Upgrade Ruby immediately so Gem/FPM works (requires Ruby 2.7+)
+          if [ "${{ matrix.rocky_version }}" = "8" ]; then
+            dnf module enable -y ruby:3.0
+            dnf install -y ruby ruby-devel
+          fi
+          dnf install -y git wget jq rpm-build gcc make
+
+      - name: Clone Repository
+        run: |
+          git clone https://github.com/mkrug1981/trafficserver.git
+          cd trafficserver
+          git checkout ${{ github.ref_name }}
+          echo "Building ref: ${{ github.ref_name }}"
+
+      - name: Install Build Dependencies
+        run: |
+          dnf install -y epel-release
+          # Enable necessary repos for headers
+          dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null || true
+          dnf config-manager --set-enabled devel 2>/dev/null || true
+          
+          dnf groupinstall -y "Development Tools"
+          
+          # Rocky 8: Modern GCC needed for ATS 11 C++20 support
+          if [ "${{ matrix.rocky_version }}" = "8" ]; then
+            dnf install -y gcc-toolset-11 gcc-toolset-11-gcc-c++
+          fi
+
+          # Define dependency list
+          DEPS="gcc gcc-c++ cmake ninja-build make pkgconfig openssl-devel \
+            pcre2-devel libcap-devel hwloc-devel libcurl-devel \
+            ncurses-devel tcl-devel expat-devel perl-ExtUtils-MakeMaker \
+            flex bison zlib-devel libxml2-devel libunwind-devel \
+            libyaml-devel python3 python3-pip python3-devel autoconf \
+            automake libtool libmaxminddb-devel luajit-devel jansson-devel \
+            brotli-devel"
+
+          # Rocky 10: pcre-devel is deprecated/removed
+          if [ "${{ matrix.rocky_version }}" != "10" ]; then
+            DEPS="$DEPS pcre-devel"
+          fi
+
+          dnf install -y $DEPS
+
+      - name: Configure ATS with CMake
+        run: |
+          cd trafficserver
+          CONFIG_CMD="cmake -B build-release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/trafficserver \
+            -DENABLE_EXPERIMENTAL_PLUGINS=ON \
+            -DENABLE_HWLOC=ON \
+            -DENABLE_SYSTEM_STATS=ON \
+            -DENABLE_RATE_LIMIT=ON \
+            -DENABLE_REDO_CACHE_LOOKUP=ON \
+            -DENABLE_MONEY_TRACE=ON \
+            -DENABLE_MAXMIND_ACL=ON \
+            -DENABLE_HTTP_STATS=ON \
+            -DENABLE_FQ_PACING=ON \
+            -DENABLE_ACCESS_CONTROL=ON \
+            -DENABLE_BLOCK_ERRORS=ON \
+            -DENABLE_TXN_BOX=ON \
+            -GNinja"
+          
+          if [ "${{ matrix.rocky_version }}" = "8" ]; then
+            scl enable gcc-toolset-11 "$CONFIG_CMD"
+          else
+            eval $CONFIG_CMD
+          fi
+
+      - name: Build and Install
+        run: |
+          cd trafficserver
+          if [ "${{ matrix.rocky_version }}" = "8" ]; then
+            scl enable gcc-toolset-11 "cmake --build build-release -j$(nproc)"
+            scl enable gcc-toolset-11 "cmake --build build-release --target install"
+          else
+            cmake --build build-release -j$(nproc)
+            cmake --build build-release --target install
+          fi
+
+      - name: Create Systemd Unit File
+        run: |
+          cat <<EOF > trafficserver.service
+          [Unit]
+          Description=Apache Traffic Server
+          After=network.target remote-fs.target nss-lookup.target
+
+          [Service]
+          Type=simple
+          Environment="TS_ROOT=/opt/trafficserver"
+          ExecStart=/opt/trafficserver/bin/traffic_server
+          ExecReload=/opt/trafficserver/bin/traffic_ctl config reload
+          ExecStop=/opt/trafficserver/bin/traffic_server stop
+          Restart=on-failure
+          RestartSec=5s
+          KillMode=process
+          LimitNOFILE=1000000
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+      - name: Package RPM
+        run: |
+          gem install --no-document fpm
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version | head -n1 | awk '{print $4}')
+          
+          fpm -s dir -t rpm \
+            --name "trafficserver" \
+            --version "$VERSION" \
+            --iteration "1.el${{ matrix.rocky_version }}" \
+            --architecture x86_64 \
+            --description "Apache Traffic Server with full experimental features and Systemd support" \
+            --package "trafficserver-${VERSION}-rocky${{ matrix.rocky_version }}.rpm" \
+            /opt/trafficserver \
+            trafficserver.service=/usr/lib/systemd/system/trafficserver.service
+
+      - name: Upload RPM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ats-rpm-rocky${{ matrix.rocky_version }}
+          path: "*.rpm"

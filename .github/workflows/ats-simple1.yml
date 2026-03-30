@@ -3,11 +3,6 @@ name: Build Apache Traffic Server
 on:
   workflow_dispatch:
     inputs:
-      ats_versions:
-        description: 'Search Query (e.g., "10", "11.0.x", "all", or "10.0.1")'
-        required: true
-        default: 'all'
-        type: string
       rocky_versions:
         description: 'Rocky Linux versions (comma-separated: 8,9,10)'
         required: true
@@ -18,76 +13,15 @@ jobs:
   discover-versions:
     runs-on: ubuntu-latest
     outputs:
-      ats_versions: ${{ steps.find-versions.outputs.ats_versions }}
       rocky_versions: ${{ steps.set-rocky.outputs.rocky_versions }}
-
     steps:
-      - name: Discover ATS branches (future-proof + safe)
-        id: find-versions
-        run: |
-          set -e
-
-          BRANCHES=$(git ls-remote --heads https://github.com/apache/trafficserver.git \
-            | awk '{print $2}' \
-            | sed 's#refs/heads/##')
-
-          ATS_10=$(echo "$BRANCHES" | grep -E '^10\.[0-9]+\.x$' | sort -V || true)
-          ATS_11_STABLE=$(echo "$BRANCHES" | grep -E '^11\.[0-9]+\.x$' | sort -V || true)
-          ATS_11_DEV=$(echo "$BRANCHES" | grep -E '^11-dev$' || true)
-
-          if [ -n "$ATS_11_STABLE" ]; then
-            ATS_11="$ATS_11_STABLE"
-          else
-            ATS_11="$ATS_11_DEV"
-          fi
-
-          # Clean merge (no empty lines)
-          ALL_BRANCHES=$(printf "%s\n%s\n" "$ATS_10" "$ATS_11" | grep -v '^$' || true)
-
-          INPUT="${{ github.event.inputs.ats_versions }}"
-
-          build_json() {
-            if [ $# -eq 0 ]; then
-              echo "[]"
-            else
-              printf '%s\n' "$@" | grep -v '^$' | jq -R . | jq -s .
-            fi
-          }
-
-          if [[ "$INPUT" == "all" || "$INPUT" == "all-with-11" ]]; then
-            VERSIONS_JSON=$(build_json $ALL_BRANCHES)
-          else
-            VALID=()
-            IFS=',' read -ra REQ <<< "$INPUT"
-
-            for v in "${REQ[@]}"; do
-              v=$(echo "$v" | xargs)
-
-              if echo "$ALL_BRANCHES" | grep -q "^$v$"; then
-                VALID+=("$v")
-              else
-                echo "Skipping invalid branch: $v"
-              fi
-            done
-
-            VERSIONS_JSON=$(build_json "${VALID[@]}")
-          fi
-
-          # Safety check
-          if [ -z "$VERSIONS_JSON" ] || [ "$VERSIONS_JSON" = "[]" ]; then
-            echo "Error: No valid ATS branches found"
-            exit 1
-          fi
-
-          echo "Final ATS versions: $VERSIONS_JSON"
-          echo "ats_versions=$VERSIONS_JSON" >> $GITHUB_OUTPUT
-
       - name: Set Rocky Linux versions
         id: set-rocky
         run: |
           ROCKY_VERSIONS='${{ github.event.inputs.rocky_versions }}'
           ROCKY_JSON=$(echo $ROCKY_VERSIONS | jq -R -c 'split(",") | map(gsub("^\\s+|\\s+$";""))')
           echo "rocky_versions=$ROCKY_JSON" >> $GITHUB_OUTPUT
+          echo "Rocky Linux versions: $ROCKY_JSON"
 
   build-ats:
     needs: discover-versions
@@ -95,85 +29,87 @@ jobs:
       fail-fast: false
       matrix:
         rocky_version: ${{ fromJson(needs.discover-versions.outputs.rocky_versions) }}
-        ats_version: ${{ fromJson(needs.discover-versions.outputs.ats_versions) }}
-
+    
     runs-on: ubuntu-latest
-
     container:
       image: rockylinux:${{ matrix.rocky_version }}
-
+    
     steps:
-      - name: Install git and tools
+      - name: Install git and basic tools
         run: |
           dnf install -y git wget jq
 
-      - name: Clone repository
+      - name: Clone Traffic Server repository
         run: |
-          git clone https://github.com/apache/trafficserver.git
+          # Clones your specific fork
+          git clone https://github.com/mkrug1981/trafficserver.git
           cd trafficserver
-          git checkout ${{ matrix.ats_version }}
-          echo "Building: ${{ matrix.ats_version }}"
+          # Checks out the branch/tag selected in the 'Use workflow from' dropdown
+          git checkout ${{ github.ref_name }}
+          echo "Building ATS from selected reference: ${{ github.ref_name }}"
           git log -1 --oneline
+          git describe --tags --always
 
       - name: Install dependencies
         run: |
           dnf install -y epel-release
           dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null || true
           dnf groupinstall -y "Development Tools"
-
+          
           dnf install -y \
-            gcc gcc-c++ cmake ninja-build make pkgconfig \
-            openssl-devel pcre-devel pcre2-devel libcap-devel \
-            hwloc-devel libcurl-devel ncurses-devel tcl-devel \
-            expat-devel perl-ExtUtils-MakeMaker flex bison git \
-            zlib-devel libxml2-devel libunwind-devel libyaml-devel \
-            python3 python3-pip python3-devel autoconf automake \
-            libtool libmaxminddb-devel luajit-devel jansson-devel \
+            gcc gcc-c++ cmake ninja-build make pkgconfig openssl-devel \
+            pcre-devel pcre2-devel libcap-devel hwloc-devel libcurl-devel \
+            ncurses-devel tcl-devel expat-devel perl-ExtUtils-MakeMaker \
+            flex bison git zlib-devel libxml2-devel libunwind-devel \
+            libyaml-devel python3 python3-pip python3-devel autoconf \
+            automake libtool libmaxminddb-devel luajit-devel jansson-devel \
             brotli-devel
+          
+          dnf install -y liburing-devel 2>/dev/null || echo "liburing-devel not available"
+          dnf install -y yaml-cpp-devel 2>/dev/null || echo "yaml-cpp-devel not available"
 
-          dnf install -y liburing-devel 2>/dev/null || true
-          dnf install -y yaml-cpp-devel 2>/dev/null || true
-
-      - name: Configure ATS
+      - name: Configure ATS with CMake
         run: |
           cd trafficserver
-
-          ATS_FLAGS="
-            -DENABLE_EXPERIMENTAL_PLUGINS=ON
-            -DENABLE_HWLOC=ON
-            -DENABLE_SYSTEM_STATS=ON
-            -DENABLE_RATE_LIMIT=ON
-            -DENABLE_REDO_CACHE_LOOKUP=ON
-            -DENABLE_MONEY_TRACE=ON
-            -DENABLE_MAXMIND_ACL=ON
-            -DENABLE_HTTP_STATS=ON
-            -DENABLE_FQ_PACING=ON
-            -DENABLE_ACCESS_CONTROL=ON
-            -DENABLE_BLOCK_ERRORS=ON
-            -DENABLE_TXN_BOX=ON
-          "
-
-          cmake -B build \
+          cmake -B build-release \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/opt/trafficserver \
-            $ATS_FLAGS \
+            -DENABLE_EXPERIMENTAL_PLUGINS=ON \
+            -DENABLE_HWLOC=ON \
+            -DENABLE_SYSTEM_STATS=ON \
+            -DENABLE_RATE_LIMIT=ON \
+            -DENABLE_REDO_CACHE_LOOKUP=ON \
+            -DENABLE_MONEY_TRACE=ON \
+            -DENABLE_MAXMIND_ACL=ON \
+            -DENABLE_HTTP_STATS=ON \
+            -DENABLE_FQ_PACING=ON \
+            -DENABLE_ACCESS_CONTROL=ON \
+            -DENABLE_BLOCK_ERRORS=ON \
+            -DENABLE_TXN_BOX=ON \
             -GNinja
 
-      - name: Build
+      - name: Build Apache Traffic Server
         run: |
           cd trafficserver
-          cmake --build build -j$(nproc)
+          cmake --build build-release -j$(nproc)
 
-      - name: Test (non-blocking)
+      - name: Run tests
         run: |
           cd trafficserver
-          cmake --build build --target test || true
+          cmake --build build-release --target test || true
 
-      - name: Install
+      - name: Install Apache Traffic Server
         run: |
           cd trafficserver
-          cmake --build build --target install
+          cmake --build build-release --target install
 
-      - name: Show version
+      - name: Get ATS version and info
+        id: ats_info
         run: |
-          /opt/trafficserver/bin/traffic_server --version
+          cd trafficserver
+          BINARY_VERSION=$(/opt/trafficserver/bin/traffic_server --version | head -n1 | awk '{print $4}')
+          GIT_HASH=$(git rev-parse --short HEAD)
+          
+          echo "version=$BINARY_VERSION" >> $GITHUB_OUTPUT
+          echo "git_hash=$GIT_HASH" >> $GITHUB_OUTPUT
+          echo "Building: $BINARY_VERSION ($GIT_HASH) on Rocky ${{ matrix.rocky_version }}"

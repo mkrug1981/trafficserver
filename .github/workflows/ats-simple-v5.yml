@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server v4
+name: Build Apache Traffic Server v5
 
 on:
   workflow_dispatch:

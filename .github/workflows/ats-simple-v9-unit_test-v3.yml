@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server RPM v9v3
+name: Build Apache Traffic Server RPM v9v4
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -270,7 +270,17 @@ jobs:
           set -euo pipefail
 
           cd trafficserver
+
+          echo "Locating Catch2 and build-tree libraries..."
+
+          LIB_DIRS=$(find build -type f \( -name 'libCatch2Main.so*' -o -name 'libCatch2.so*' -o -name '*.so' \) \
+            -printf '%h\n' | sort -u | tr '\n' ':')
+
+          export LD_LIBRARY_PATH="${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
           echo "Running ATS unit tests..."
+
           ctest --test-dir build --output-on-failure -j"$(nproc)"
 
       - name: Show built version

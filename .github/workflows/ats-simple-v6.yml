@@ -90,6 +90,21 @@ jobs:
           echo "Building ref: $(git rev-parse --abbrev-ref HEAD || true)"
           git log -1 --oneline
 
+      - name: Verify checkout
+        run: |
+          cd trafficserver
+
+          echo "Selected ref: ${{ github.ref_name }}"
+          git log -1 --oneline --decorate
+
+          git fetch origin
+          
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse origin/${{ github.ref_name }} 2>/dev/null || echo "N/A")
+          
+          echo "LOCAL:  $LOCAL"
+          echo "REMOTE: $REMOTE"
+
       - name: Install Build Dependencies
         shell: bash
         run: |

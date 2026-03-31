@@ -1,5 +1,8 @@
 name: Build Apache Traffic Server v5
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   workflow_dispatch:
     inputs:
@@ -155,7 +158,7 @@ jobs:
             trafficserver.service=/usr/lib/systemd/system/trafficserver.service
 
       - name: Upload RPM Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ats-rpm-rocky${{ matrix.rocky_version }}
           path: "*.rpm"

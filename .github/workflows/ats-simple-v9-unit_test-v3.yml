@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server RPM v9v5
+name: Build Apache Traffic Server RPM v9v6
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -305,24 +305,26 @@ jobs:
 
           cd trafficserver
 
+          BUILD_ROOT="$(pwd)/build"
+
           echo "Searching for Catch2 libs..."
-          find build \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' \) -print || true
+          find "$BUILD_ROOT" \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' \) -print || true
 
           LIB_DIRS=$(
-            find build \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' -o -name '*.so*' \) \
+            find "$BUILD_ROOT" \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' -o -name '*.so*' \) \
               -printf '%h\n' 2>/dev/null | sort -u | tr '\n' ':'
           )
 
-          export LD_LIBRARY_PATH="build:build/lib:build/lib64:${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH="${BUILD_ROOT}:${BUILD_ROOT}/lib:${BUILD_ROOT}/lib64:${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
           echo "Example test binary deps:"
-          ldd build/lib/swoc/unit_tests/test_libswoc || true
-          ldd build/src/tsutil/test_tsutil || true
+          ldd "$BUILD_ROOT/lib/swoc/unit_tests/test_libswoc" || true
+          ldd "$BUILD_ROOT/src/tsutil/test_tsutil" || true
 
           echo "Running ATS unit tests..."
-          ctest --test-dir build --output-on-failure -j"$(nproc)"
+          ctest --test-dir "$BUILD_ROOT" --output-on-failure -j"$(nproc)"
 
       - name: Show built version
         shell: bash

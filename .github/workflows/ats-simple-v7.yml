@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server RPM
+name: Build Apache Traffic Server RPM v10
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

@@ -327,14 +327,15 @@ jobs:
           - Automated build from commit __HASH__
           EOF
 
+          # Debug values (bash)
+          printf 'VERSION=[%s]\nRELEASE=[%s]\nHASH=[%s]\nDATE=[%s]\n' \
+            "$VERSION" "$RELEASE" "$HASH" "$DATE_STR"
+
           python3 - <<PY
           from pathlib import Path
 
           spec = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
           text = spec.read_text()
-
-          printf 'VERSION=[%s]\nRELEASE=[%s]\nHASH=[%s]\nDATE=[%s]\n' \
-            "$VERSION" "$RELEASE" "$HASH" "$DATE_STR"
         
           replacements = {
               "__VERSION__": """$VERSION""".strip(),

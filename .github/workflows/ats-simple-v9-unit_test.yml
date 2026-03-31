@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server RPM v9 unit-test
+name: Build Apache Traffic Server RPM v9 unit test
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -137,17 +137,20 @@ jobs:
           * __DATE__ Test
           EOF
 
-          python3 - <<PY
+          export VERSION RELEASE HASH DATE_STR
+
+          python3 - <<'PY'
           from pathlib import Path
+          import os
 
           spec = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
           text = spec.read_text()
 
           replacements = {
-              "__VERSION__": """$VERSION""".strip(),
-              "__RELEASE__": """$RELEASE""".strip(),
-              "__HASH__": """$HASH""".strip(),
-              "__DATE__": """$DATE_STR""".strip(),
+              "__VERSION__": os.environ["VERSION"],
+              "__RELEASE__": os.environ["RELEASE"],
+              "__HASH__": os.environ["HASH"],
+              "__DATE__": os.environ["DATE_STR"],
           }
 
           for k, v in replacements.items():
@@ -243,7 +246,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          /opt/trafficserver/bin/traffic_server --version
+          /opt/trafficserver/bin/traffic_server --version || true
 
       - name: Create RPM spec
         shell: bash
@@ -252,12 +255,28 @@ jobs:
 
           mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 
-          VERSION=$(/opt/trafficserver/bin/traffic_server --version | awk '{print $4}')
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
           RELEASE="${{ inputs.build_release }}"
           HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
           DATE_STR=$(date +"%a %b %d %Y")
 
-          cat > ~/rpmbuild/SPECS/trafficserver.spec <<'EOF'
+          if [ -z "$VERSION" ]; then
+            echo "Failed to detect ATS version"
+            /opt/trafficserver/bin/traffic_server --version || true
+            exit 1
+          fi
+
+          printf 'VERSION=[%s]\nRELEASE=[%s]\nHASH=[%s]\nDATE=[%s]\n' \
+            "$VERSION" "$RELEASE" "$HASH" "$DATE_STR"
+
+          export VERSION RELEASE HASH DATE_STR
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+          import os
+
+          spec_text = dedent(r"""
           Name:           trafficserver
           Version:        __VERSION__
           Release:        __RELEASE__%{?dist}
@@ -334,29 +353,24 @@ jobs:
           %changelog
           * __DATE__ CI Build
           - Automated build from commit __HASH__
-          EOF
-
-          python3 - <<PY
-          from pathlib import Path
-
-          spec = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
-          text = spec.read_text()
+          """).lstrip()
 
           replacements = {
-              "__VERSION__": """$VERSION""".strip(),
-              "__RELEASE__": """$RELEASE""".strip(),
-              "__HASH__": """$HASH""".strip(),
-              "__DATE__": """$DATE_STR""".strip(),
+              "__VERSION__": os.environ["VERSION"],
+              "__RELEASE__": os.environ["RELEASE"],
+              "__HASH__": os.environ["HASH"],
+              "__DATE__": os.environ["DATE_STR"],
           }
 
-          for k, v in replacements.items():
-              text = text.replace(k, v)
+          for key, value in replacements.items():
+              spec_text = spec_text.replace(key, value)
 
-          spec.write_text(text)
+          spec_path = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
+          spec_path.write_text(spec_text)
+
+          print("Generated spec:")
+          print(spec_text)
           PY
-
-          echo "Generated spec:"
-          sed -n '1,220p' ~/rpmbuild/SPECS/trafficserver.spec
 
       - name: Build RPM
         shell: bash
@@ -372,11 +386,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION=$(/opt/trafficserver/bin/traffic_server --version | awk '{print $4}')
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
           RELEASE="${{ inputs.build_release }}"
           HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
           ROCKY="${{ matrix.rocky }}"
           ARCH=$(uname -m)
+
+          if [ -z "$VERSION" ]; then
+            echo "Failed to detect ATS version"
+            /opt/trafficserver/bin/traffic_server --version || true
+            exit 1
+          fi
 
           FILE=$(find ~/rpmbuild/RPMS -type f -name "*.rpm" ! -name "*debuginfo*" ! -name "*debugsource*" | head -n1)
 

@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server RPM v9v4
+name: Build Apache Traffic Server RPM v9v5
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -221,9 +221,17 @@ jobs:
           ATS_FLAGS=(
             -DCMAKE_BUILD_TYPE=Release
             -DCMAKE_INSTALL_PREFIX=/opt/trafficserver
+
+            # Build-tree runtime paths for unit tests
+            -DCMAKE_SKIP_BUILD_RPATH=FALSE
+            -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
+            -DCMAKE_BUILD_RPATH=\$ORIGIN:\$ORIGIN/..:\$ORIGIN/../lib:\$ORIGIN/../../lib:\$ORIGIN/../../../lib:\$ORIGIN/../lib64:\$ORIGIN/../../lib64:\$ORIGIN/../../../lib64
+
+            # Install-tree runtime paths for packaged binaries
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
             -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib:\$ORIGIN/../lib64:\$ORIGIN/../../lib:\$ORIGIN/../../lib64
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE
+
             -DBUILD_EXPERIMENTAL_PLUGINS=ON
             -DENABLE_HWLOC=ON
             -DENABLE_SYSTEM_STATS=ON
@@ -246,8 +254,8 @@ jobs:
 
           cmake -B build "${ATS_FLAGS[@]}"
 
-          echo "Installed RPATH setting:"
-          grep -E 'CMAKE_INSTALL_RPATH|CMAKE_BUILD_WITH_INSTALL_RPATH' build/CMakeCache.txt || true
+          echo "Configured RPATH settings:"
+          grep -E 'CMAKE_(BUILD|INSTALL)_RPATH|CMAKE_SKIP_BUILD_RPATH|CMAKE_BUILD_RPATH_USE_ORIGIN' build/CMakeCache.txt || true
 
           cmake --build build -j"$(nproc)"
           cmake --install build
@@ -271,16 +279,23 @@ jobs:
 
           cd trafficserver
 
-          echo "Locating Catch2 and build-tree libraries..."
+          echo "Searching for Catch2 libs..."
+          find build \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' \) -print || true
 
-          LIB_DIRS=$(find build -type f \( -name 'libCatch2Main.so*' -o -name 'libCatch2.so*' -o -name '*.so' \) \
-            -printf '%h\n' | sort -u | tr '\n' ':')
+          LIB_DIRS=$(
+            find build \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' -o -name '*.so*' \) \
+              -printf '%h\n' 2>/dev/null | sort -u | tr '\n' ':'
+          )
 
-          export LD_LIBRARY_PATH="${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LD_LIBRARY_PATH="build:build/lib:build/lib64:${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-          echo "Running ATS unit tests..."
 
+          echo "Example test binary deps:"
+          ldd build/lib/swoc/unit_tests/test_libswoc || true
+          ldd build/src/tsutil/test_tsutil || true
+
+          echo "Running ATS unit tests..."
           ctest --test-dir build --output-on-failure -j"$(nproc)"
 
       - name: Show built version
@@ -351,29 +366,44 @@ jobs:
           mkdir -p %{buildroot}/var/log/trafficserver
           mkdir -p %{buildroot}/var/cache/trafficserver
 
+          mkdir -p %{buildroot}/etc/sysconfig
+          cat > %{buildroot}/etc/sysconfig/trafficserver <<'SYSCONFIG'
+          # Additional arguments passed to traffic_server
+          TS_DAEMON_ARGS=""
+          SYSCONFIG
+
           mkdir -p %{buildroot}/usr/lib/systemd/system
           cat > %{buildroot}/usr/lib/systemd/system/trafficserver.service <<'SERVICE'
           [Unit]
-          Description=Apache Traffic Server
+          Description=Apache Traffic Server is a fast, scalable and extensible caching proxy server.
           After=network.target
 
           [Service]
-          Type=forking
-          ExecStart=/opt/trafficserver/bin/trafficserver start
-          ExecStop=/opt/trafficserver/bin/trafficserver stop
-          ExecReload=/bin/sh -c '/bin/kill -HUP $MAINPID || /opt/trafficserver/bin/trafficserver restart'
-          PIDFile=/opt/trafficserver/var/trafficserver/server.lock
+          Type=simple
           User=trafficserver
           Group=trafficserver
-          Restart=always
-          RestartSec=5
-          LimitNOFILE=100000
+          EnvironmentFile=-/etc/sysconfig/trafficserver
+          RuntimeDirectory=trafficserver
+          RuntimeDirectoryMode=0755
+          ExecStart=/opt/trafficserver/bin/traffic_server --bind_stdout /opt/trafficserver/var/log/trafficserver/traffic.out --bind_stderr /opt/trafficserver/var/log/trafficserver/traffic.out $TS_DAEMON_ARGS
+          Restart=on-failure
+          RestartSec=5s
+          LimitNOFILE=1000000
+          ExecStopPost=/bin/sh -c 'export TS_PIDFILE=$(/opt/trafficserver/bin/traffic_layout 2>/dev/null | grep RUNTIMEDIR | cut -d: -f2)/server.lock; /bin/rm -f $TS_PIDFILE'
+          TimeoutStopSec=5s
+          ExecReload=/opt/trafficserver/bin/traffic_ctl config reload
           NoNewPrivileges=true
           PrivateTmp=true
+          CPUAccounting=true
+          MemoryAccounting=true
 
           [Install]
           WantedBy=multi-user.target
           SERVICE
+
+          chown -R trafficserver:trafficserver %{buildroot}/opt/trafficserver
+          chown -R trafficserver:trafficserver %{buildroot}/var/log/trafficserver
+          chown -R trafficserver:trafficserver %{buildroot}/var/cache/trafficserver
 
           %pre
           getent group trafficserver >/dev/null || groupadd -r trafficserver
@@ -397,6 +427,7 @@ jobs:
           /var/log/trafficserver
           /var/cache/trafficserver
           /usr/lib/systemd/system/trafficserver.service
+          %config(noreplace) /etc/sysconfig/trafficserver
 
           %changelog
           * __DATE__ CI Build

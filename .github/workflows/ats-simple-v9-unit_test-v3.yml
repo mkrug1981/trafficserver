@@ -193,7 +193,7 @@ jobs:
             flex bison zlib-devel libxml2-devel libunwind-devel \
             libyaml-devel python3 python3-pip python3-devel autoconf \
             automake libtool libmaxminddb-devel luajit-devel jansson-devel \
-            brotli-devel systemd-rpm-macros binutils"
+            brotli-devel systemd-rpm-macros binutils patchelf"
 
           if [ "$ROCKY" != "10" ]; then
             DEPS="$DEPS pcre-devel"
@@ -227,7 +227,7 @@ jobs:
             -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
             -DCMAKE_BUILD_RPATH=\$ORIGIN:\$ORIGIN/..:\$ORIGIN/../lib:\$ORIGIN/../../lib:\$ORIGIN/../../../lib:\$ORIGIN/../lib64:\$ORIGIN/../../lib64:\$ORIGIN/../../../lib64
 
-            # Install-tree runtime paths for packaged binaries
+            # ATS may override install rpath, so we still patch after install
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
             -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib:\$ORIGIN/../lib64:\$ORIGIN/../../lib:\$ORIGIN/../../lib64
             -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE
@@ -260,15 +260,41 @@ jobs:
           cmake --build build -j"$(nproc)"
           cmake --install build
 
-      - name: Check installed RPATHs
+      - name: Check installed RPATHs before patch
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "traffic_server RPATH:"
+          echo "traffic_server RPATH before patch:"
           readelf -d /opt/trafficserver/bin/traffic_server | grep -E 'RPATH|RUNPATH' || true
 
-          echo "sample plugin RPATH:"
+          echo "sample plugin RPATH before patch:"
+          SAMPLE=$(find /opt/trafficserver/libexec/trafficserver -name '*.so' | head -n1)
+          readelf -d "$SAMPLE" | grep -E 'RPATH|RUNPATH' || true
+
+      - name: Fix installed RPATHs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find /opt/trafficserver/bin -type f | while read -r f; do
+            if file "$f" | grep -q ELF; then
+              patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib64' "$f" || true
+            fi
+          done
+
+          find /opt/trafficserver/libexec/trafficserver -type f -name '*.so' | while read -r f; do
+            patchelf --set-rpath '$ORIGIN/../../lib:$ORIGIN/../../lib64' "$f" || true
+          done
+
+          find /opt/trafficserver/lib -type f \( -name '*.so' -o -name '*.so.*' \) | while read -r f; do
+            patchelf --set-rpath '$ORIGIN:$ORIGIN/../lib:$ORIGIN/../lib64' "$f" || true
+          done
+
+          echo "traffic_server RPATH after patch:"
+          readelf -d /opt/trafficserver/bin/traffic_server | grep -E 'RPATH|RUNPATH' || true
+
+          echo "sample plugin RPATH after patch:"
           SAMPLE=$(find /opt/trafficserver/libexec/trafficserver -name '*.so' | head -n1)
           readelf -d "$SAMPLE" | grep -E 'RPATH|RUNPATH' || true
 

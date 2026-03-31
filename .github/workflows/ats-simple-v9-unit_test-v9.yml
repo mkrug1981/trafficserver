@@ -1,0 +1,535 @@
+name: Build Apache Traffic Server RPM v9v10
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      ats_branch:
+        description: "Branch in mkrug1981/trafficserver"
+        required: true
+        default: "11-dev"
+        type: string
+      rocky_versions:
+        description: "Rocky Linux versions (comma-separated: 8,9,10)"
+        required: true
+        default: "8,9,10"
+        type: string
+      build_release:
+        description: "RPM release number"
+        required: true
+        default: "11"
+        type: string
+      enable_jemalloc:
+        description: "Enable jemalloc"
+        required: false
+        default: "false"
+        type: string
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      rocky_versions: ${{ steps.rocky.outputs.rocky_versions }}
+
+    steps:
+      - name: Prepare Rocky matrix
+        id: rocky
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROCKY_JSON=$(printf '%s' '${{ inputs.rocky_versions }}' | jq -R -c '
+            split(",")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+          ')
+
+          if [ "$ROCKY_JSON" = "[]" ]; then
+            echo "No valid Rocky versions provided."
+            exit 1
+          fi
+
+          echo "rocky_versions=$ROCKY_JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        rocky: ${{ fromJson(needs.prepare-matrix.outputs.rocky_versions) }}
+
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux/rockylinux:${{ matrix.rocky }}
+
+    steps:
+      - name: Install Base Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROCKY="${{ matrix.rocky }}"
+
+          dnf install -y dnf-plugins-core epel-release
+
+          if [ "$ROCKY" = "8" ]; then
+            dnf module enable -y ruby:3.0
+            dnf install -y ruby ruby-devel
+          fi
+
+          dnf install -y git wget jq rpm-build gcc make which file tar gzip python3
+
+      - name: Clone Repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Selected ATS branch: ${{ inputs.ats_branch }}"
+
+          git clone https://github.com/mkrug1981/trafficserver.git
+          cd trafficserver
+
+          git fetch --all --tags --prune
+          git checkout "${{ inputs.ats_branch }}"
+
+          echo "Checked out ref:"
+          git log -1 --oneline --decorate
+
+      - name: Verify checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd trafficserver
+          echo "Selected ATS branch: ${{ inputs.ats_branch }}"
+          echo "Current branch: $(git branch --show-current || true)"
+          echo "Current commit: $(git rev-parse HEAD)"
+          git log -1 --oneline --decorate
+
+      - name: Test RPM spec generation only
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/rpmbuild/SPECS
+
+          VERSION="TEST"
+          RELEASE="1"
+          HASH="deadbeef"
+          DATE_STR=$(date +"%a %b %d %Y")
+
+          cat > ~/rpmbuild/SPECS/trafficserver.spec <<'EOF'
+          Name: trafficserver
+          Version: __VERSION__
+          Release: __RELEASE__%{?dist}
+          Summary: Apache Traffic Server
+
+          BuildArch: x86_64
+          %global git_commit __HASH__
+
+          %description
+          Test spec
+
+          %install
+          mkdir -p %{buildroot}/opt
+
+          %files
+          /opt
+
+          %changelog
+          * __DATE__ Test
+          EOF
+
+          export VERSION RELEASE HASH DATE_STR
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          spec = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
+          text = spec.read_text()
+
+          replacements = {
+              "__VERSION__": os.environ["VERSION"],
+              "__RELEASE__": os.environ["RELEASE"],
+              "__HASH__": os.environ["HASH"],
+              "__DATE__": os.environ["DATE_STR"],
+          }
+
+          for k, v in replacements.items():
+              text = text.replace(k, v)
+
+          spec.write_text(text)
+          PY
+
+          echo "==== TEST SPEC FILE ===="
+          cat ~/rpmbuild/SPECS/trafficserver.spec
+
+      - name: Install Build Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROCKY="${{ matrix.rocky }}"
+
+          if [ "$ROCKY" = "8" ]; then
+            dnf config-manager --set-enabled powertools
+          else
+            dnf config-manager --set-enabled crb || true
+          fi
+
+          dnf config-manager --set-enabled devel 2>/dev/null || true
+          dnf groupinstall -y "Development Tools"
+
+          if [ "$ROCKY" = "8" ]; then
+            dnf install -y gcc-toolset-11 gcc-toolset-11-gcc-c++
+          fi
+
+          DEPS="gcc gcc-c++ cmake ninja-build make pkgconfig openssl-devel \
+            pcre2-devel libcap-devel hwloc-devel libcurl-devel \
+            ncurses-devel tcl-devel expat-devel perl-ExtUtils-MakeMaker \
+            flex bison zlib-devel libxml2-devel libunwind-devel \
+            libyaml-devel python3 python3-pip python3-devel autoconf \
+            automake libtool libmaxminddb-devel luajit-devel jansson-devel \
+            brotli-devel systemd-rpm-macros binutils patchelf"
+
+          if [ "$ROCKY" != "10" ]; then
+            DEPS="$DEPS pcre-devel"
+          fi
+
+          if [ "${{ inputs.enable_jemalloc }}" = "true" ]; then
+            DEPS="$DEPS jemalloc-devel"
+          fi
+
+          dnf install -y $DEPS
+          dnf install -y liburing-devel 2>/dev/null || true
+          dnf install -y yaml-cpp-devel 2>/dev/null || true
+
+      - name: Build ATS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd trafficserver
+
+          if [ "${{ matrix.rocky }}" = "8" ]; then
+            source /opt/rh/gcc-toolset-11/enable
+          fi
+
+          ATS_FLAGS=(
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX=/opt/trafficserver
+
+            -DCMAKE_SKIP_BUILD_RPATH=FALSE
+            -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON
+            -DCMAKE_BUILD_RPATH=\$ORIGIN:\$ORIGIN/..:\$ORIGIN/../lib:\$ORIGIN/../../lib:\$ORIGIN/../../../lib:\$ORIGIN/../lib64:\$ORIGIN/../../lib64:\$ORIGIN/../../../lib64
+
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+            -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib:\$ORIGIN/../lib64:\$ORIGIN/../../lib:\$ORIGIN/../../lib64
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=FALSE
+
+            -DBUILD_EXPERIMENTAL_PLUGINS=ON
+            -DENABLE_HWLOC=ON
+            -DENABLE_SYSTEM_STATS=ON
+            -DENABLE_RATE_LIMIT=ON
+            -DENABLE_REDO_CACHE_LOOKUP=ON
+            -DENABLE_MONEY_TRACE=ON
+            -DENABLE_MAXMIND_ACL=ON
+            -DENABLE_HTTP_STATS=ON
+            -DENABLE_FQ_PACING=ON
+            -DENABLE_ACCESS_CONTROL=ON
+            -DENABLE_BLOCK_ERRORS=ON
+            -DENABLE_TXN_BOX=ON
+            -GNinja
+          )
+
+          if [ "${{ inputs.enable_jemalloc }}" = "true" ]; then
+            echo "Enabling jemalloc"
+            ATS_FLAGS+=(-DENABLE_JEMALLOC=ON)
+          fi
+
+          cmake -B build "${ATS_FLAGS[@]}"
+
+          echo "Configured RPATH settings:"
+          grep -E 'CMAKE_(BUILD|INSTALL)_RPATH|CMAKE_SKIP_BUILD_RPATH|CMAKE_BUILD_RPATH_USE_ORIGIN' build/CMakeCache.txt || true
+
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Check installed RPATHs before patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "traffic_server RPATH before patch:"
+          readelf -d /opt/trafficserver/bin/traffic_server | grep -E 'RPATH|RUNPATH' || true
+
+          echo "sample plugin RPATH before patch:"
+          SAMPLE=$(find /opt/trafficserver/libexec/trafficserver -name '*.so' | head -n1)
+          readelf -d "$SAMPLE" | grep -E 'RPATH|RUNPATH' || true
+
+      - name: Fix installed RPATHs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find /opt/trafficserver/bin -type f | while read -r f; do
+            if file "$f" | grep -q ELF; then
+              patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib64' "$f" || true
+            fi
+          done
+
+          find /opt/trafficserver/libexec/trafficserver -type f -name '*.so' | while read -r f; do
+            patchelf --set-rpath '$ORIGIN/../../lib:$ORIGIN/../../lib64' "$f" || true
+          done
+
+          find /opt/trafficserver/lib -type f \( -name '*.so' -o -name '*.so.*' \) | while read -r f; do
+            patchelf --set-rpath '$ORIGIN:$ORIGIN/../lib:$ORIGIN/../lib64' "$f" || true
+          done
+
+          echo "traffic_server RPATH after patch:"
+          readelf -d /opt/trafficserver/bin/traffic_server | grep -E 'RPATH|RUNPATH' || true
+
+          echo "sample plugin RPATH after patch:"
+          SAMPLE=$(find /opt/trafficserver/libexec/trafficserver -name '*.so' | head -n1)
+          readelf -d "$SAMPLE" | grep -E 'RPATH|RUNPATH' || true
+
+      - name: Run ATS unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd trafficserver
+
+          BUILD_ROOT="$(pwd)/build"
+
+          echo "Searching for Catch2 libs..."
+          find "$BUILD_ROOT" \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' \) -print || true
+
+          LIB_DIRS=$(
+            find "$BUILD_ROOT" \( -name 'libCatch2*.so*' -o -name 'libts*.so*' -o -name 'libswoc*.so*' -o -name '*.so*' \) \
+              -printf '%h\n' 2>/dev/null | sort -u | tr '\n' ':'
+          )
+
+          export LD_LIBRARY_PATH="${BUILD_ROOT}:${BUILD_ROOT}/lib:${BUILD_ROOT}/lib64:${LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+          echo "Example test binary deps:"
+          ldd "$BUILD_ROOT/lib/swoc/unit_tests/test_libswoc" || true
+          ldd "$BUILD_ROOT/src/tsutil/test_tsutil" || true
+
+          echo "Running ATS unit tests..."
+          ctest --test-dir "$BUILD_ROOT" --output-on-failure -j"$(nproc)"
+
+      - name: Show built version
+        shell: bash
+        run: |
+          set -euo pipefail
+          /opt/trafficserver/bin/traffic_server --version || true
+
+      - name: Create RPM spec
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          RELEASE="${{ inputs.build_release }}"
+          HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
+          DATE_STR=$(date +"%a %b %d %Y")
+
+          if [ -z "$VERSION" ]; then
+            echo "Failed to detect ATS version"
+            /opt/trafficserver/bin/traffic_server --version || true
+            exit 1
+          fi
+
+          if [ "${{ inputs.enable_jemalloc }}" = "true" ]; then
+            RPM_REQUIRES="Requires:       jemalloc"
+          else
+            RPM_REQUIRES=""
+          fi
+
+          printf 'VERSION=[%s]\nRELEASE=[%s]\nHASH=[%s]\nDATE=[%s]\n' \
+            "$VERSION" "$RELEASE" "$HASH" "$DATE_STR"
+
+          export VERSION RELEASE HASH DATE_STR RPM_REQUIRES
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+          import os
+
+          spec_text = dedent(r"""
+          Name:           trafficserver
+          Version:        __VERSION__
+          Release:        __RELEASE__%{?dist}
+          Summary:        Apache Traffic Server
+
+          License:        Apache-2.0
+          URL:            https://trafficserver.apache.org/
+          BuildArch:      x86_64
+          __RPM_REQUIRES__
+          %global git_commit __HASH__
+
+          %description
+          Apache Traffic Server built from source.
+          Git commit: %{git_commit}
+
+          %prep
+
+          %build
+
+          %install
+          rm -rf %{buildroot}
+          mkdir -p %{buildroot}/opt
+          cp -a /opt/trafficserver %{buildroot}/opt/
+
+          mkdir -p %{buildroot}/opt/trafficserver/var/log/trafficserver
+          mkdir -p %{buildroot}/opt/trafficserver/var/cache/trafficserver
+          mkdir -p %{buildroot}/opt/trafficserver/var/trafficserver
+
+          mkdir -p %{buildroot}/etc/sysconfig
+          cat > %{buildroot}/etc/sysconfig/trafficserver <<'SYSCONFIG'
+          # Additional arguments passed to traffic_server
+          TS_DAEMON_ARGS=""
+          SYSCONFIG
+
+          mkdir -p %{buildroot}/usr/lib/systemd/system
+          cat > %{buildroot}/usr/lib/systemd/system/trafficserver.service <<'SERVICE'
+          [Unit]
+          Description=Apache Traffic Server is a fast, scalable and extensible caching proxy server.
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=trafficserver
+          Group=trafficserver
+          EnvironmentFile=-/etc/sysconfig/trafficserver
+          RuntimeDirectory=trafficserver
+          RuntimeDirectoryMode=0755
+          ExecStart=/opt/trafficserver/bin/traffic_server --bind_stdout /opt/trafficserver/var/log/trafficserver/traffic.out --bind_stderr /opt/trafficserver/var/log/trafficserver/traffic.out $TS_DAEMON_ARGS
+          Restart=on-failure
+          RestartSec=5s
+          LimitNOFILE=1000000
+          ExecStopPost=/bin/sh -c 'export TS_PIDFILE=$(/opt/trafficserver/bin/traffic_layout 2>/dev/null | grep RUNTIMEDIR | cut -d: -f2)/server.lock; /bin/rm -f $TS_PIDFILE'
+          TimeoutStopSec=5s
+          ExecReload=/opt/trafficserver/bin/traffic_ctl config reload
+          NoNewPrivileges=true
+          PrivateTmp=true
+          CPUAccounting=true
+          MemoryAccounting=true
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          %pre
+          getent group trafficserver >/dev/null || groupadd -r trafficserver
+          getent passwd trafficserver >/dev/null || useradd -r -g trafficserver -d /opt/trafficserver/var/cache/trafficserver -s /sbin/nologin trafficserver
+
+          %post
+          mkdir -p \
+            /opt/trafficserver/var/log/trafficserver \
+            /opt/trafficserver/var/cache/trafficserver \
+            /opt/trafficserver/var/trafficserver
+
+          chown -R trafficserver:trafficserver \
+            /opt/trafficserver/var/log/trafficserver \
+            /opt/trafficserver/var/cache/trafficserver \
+            /opt/trafficserver/var/trafficserver || true
+
+          systemctl daemon-reload || true
+          systemctl enable trafficserver || true
+
+          %preun
+          if [ $1 -eq 0 ]; then
+            systemctl stop trafficserver || true
+            systemctl disable trafficserver || true
+          fi
+
+          %postun
+          systemctl daemon-reload || true
+
+          %files
+          /opt/trafficserver
+          %dir %attr(0755,trafficserver,trafficserver) /opt/trafficserver/var
+          %dir %attr(0755,trafficserver,trafficserver) /opt/trafficserver/var/log
+          %dir %attr(0755,trafficserver,trafficserver) /opt/trafficserver/var/log/trafficserver
+          %dir %attr(0755,trafficserver,trafficserver) /opt/trafficserver/var/cache
+          %dir %attr(0755,trafficserver,trafficserver) /opt/trafficserver/var/cache/trafficserver
+          %dir %attr(0755,trafficserver,trafficserver) /opt/trafficserver/var/trafficserver
+          /usr/lib/systemd/system/trafficserver.service
+          %config(noreplace) /etc/sysconfig/trafficserver
+
+          %changelog
+          * __DATE__ CI Build
+          - Automated build from commit __HASH__
+          """).lstrip()
+
+          replacements = {
+              "__VERSION__": os.environ["VERSION"],
+              "__RELEASE__": os.environ["RELEASE"],
+              "__HASH__": os.environ["HASH"],
+              "__DATE__": os.environ["DATE_STR"],
+              "__RPM_REQUIRES__": os.environ.get("RPM_REQUIRES", ""),
+          }
+
+          for key, value in replacements.items():
+              spec_text = spec_text.replace(key, value)
+
+          spec_path = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
+          spec_path.write_text(spec_text)
+
+          print("Generated spec:")
+          print(spec_text)
+          PY
+
+      - name: Build RPM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rpmbuild -bb ~/rpmbuild/SPECS/trafficserver.spec \
+            --define "_topdir $HOME/rpmbuild"
+
+      - name: Rename RPM
+        id: rpm_name
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+          RELEASE="${{ inputs.build_release }}"
+          HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
+          ROCKY="${{ matrix.rocky }}"
+          ARCH=$(uname -m)
+
+          if [ -z "$VERSION" ]; then
+            echo "Failed to detect ATS version"
+            /opt/trafficserver/bin/traffic_server --version || true
+            exit 1
+          fi
+
+          FILE=$(find ~/rpmbuild/RPMS -type f -name "*.rpm" ! -name "*debuginfo*" ! -name "*debugsource*" | head -n1)
+
+          if [ -z "$FILE" ]; then
+            echo "No RPM file found."
+            exit 1
+          fi
+
+          NEW="trafficserver-${VERSION}-${RELEASE}.${HASH}.el${ROCKY}.${ARCH}.rpm"
+          cp "$FILE" "$NEW"
+
+          echo "name=$NEW" >> "$GITHUB_OUTPUT"
+          echo "Created artifact: $NEW"
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.rpm_name.outputs.name }}
+          path: ${{ steps.rpm_name.outputs.name }}

@@ -1,4 +1,3 @@
-```yaml
 name: Build Apache Traffic Server RPM
 
 env:
@@ -241,4 +240,3 @@ EOF
         with:
           name: ${{ steps.rpm_name.outputs.name }}
           path: ${{ steps.rpm_name.outputs.name }}
-```

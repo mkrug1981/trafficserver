@@ -519,7 +519,7 @@ jobs:
           echo "Created artifact: $NEW"
 
       - name: Upload RPM
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.rpm_name.outputs.name }}
           path: ${{ steps.rpm_name.outputs.name }}

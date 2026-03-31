@@ -1,0 +1,297 @@
+name: Build Apache Traffic Server RPM v6
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocky_versions:
+        description: 'Rocky Linux versions (comma-separated: 8,9,10)'
+        required: true
+        default: '8,9,10'
+        type: string
+      build_release:
+        description: 'RPM release number'
+        required: true
+        default: '11'
+        type: string
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      rocky_versions: ${{ steps.rocky.outputs.rocky_versions }}
+
+    steps:
+      - name: Prepare Rocky matrix
+        id: rocky
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROCKY_JSON=$(printf '%s' '${{ inputs.rocky_versions }}' | jq -R -c '
+            split(",")
+            | map(gsub("^\\s+|\\s+$"; ""))
+            | map(select(length > 0))
+          ')
+
+          if [ "$ROCKY_JSON" = "[]" ]; then
+            echo "No valid Rocky versions provided."
+            exit 1
+          fi
+
+          echo "rocky_versions=$ROCKY_JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        rocky: ${{ fromJson(needs.prepare-matrix.outputs.rocky_versions) }}
+
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:${{ matrix.rocky }}
+
+    steps:
+      - name: Install Base Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROCKY="${{ matrix.rocky }}"
+
+          dnf install -y dnf-plugins-core epel-release
+
+          # Rocky 8: upgrade Ruby so Gem/FPM-compatible tooling works
+          if [ "$ROCKY" = "8" ]; then
+            dnf module enable -y ruby:3.0
+            dnf install -y ruby ruby-devel
+          fi
+
+          dnf install -y git wget jq rpm-build gcc make which file tar gzip
+
+      - name: Clone Repository from selected GitHub UI branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Selected workflow ref: ${{ github.ref_name }}"
+
+          git clone https://github.com/mkrug1981/trafficserver.git
+          cd trafficserver
+
+          git fetch --all --tags --prune
+
+          git checkout "${{ github.ref_name }}" || \
+            git checkout -b "${{ github.ref_name }}" "origin/${{ github.ref_name }}"
+
+          echo "Building ref: $(git rev-parse --abbrev-ref HEAD || true)"
+          git log -1 --oneline
+
+      - name: Install Build Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROCKY="${{ matrix.rocky }}"
+
+          # Enable needed repos
+          if [ "$ROCKY" = "8" ]; then
+            dnf config-manager --set-enabled powertools
+          else
+            dnf config-manager --set-enabled crb || true
+          fi
+
+          dnf config-manager --set-enabled devel 2>/dev/null || true
+
+          dnf groupinstall -y "Development Tools"
+
+          # Rocky 8: modern GCC for ATS 11 / C++20
+          if [ "$ROCKY" = "8" ]; then
+            dnf install -y gcc-toolset-11 gcc-toolset-11-gcc-c++
+          fi
+
+          DEPS="gcc gcc-c++ cmake ninja-build make pkgconfig openssl-devel \
+            pcre2-devel libcap-devel hwloc-devel libcurl-devel \
+            ncurses-devel tcl-devel expat-devel perl-ExtUtils-MakeMaker \
+            flex bison zlib-devel libxml2-devel libunwind-devel \
+            libyaml-devel python3 python3-pip python3-devel autoconf \
+            automake libtool libmaxminddb-devel luajit-devel jansson-devel \
+            brotli-devel systemd-rpm-macros"
+
+          # Rocky 10: pcre-devel is deprecated/removed
+          if [ "$ROCKY" != "10" ]; then
+            DEPS="$DEPS pcre-devel"
+          fi
+
+          dnf install -y $DEPS
+
+          # Optional deps
+          dnf install -y liburing-devel 2>/dev/null || true
+          dnf install -y yaml-cpp-devel 2>/dev/null || true
+
+      - name: Build ATS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd trafficserver
+
+          # Rocky 8: enable newer GCC in this step
+          if [ "${{ matrix.rocky }}" = "8" ]; then
+            source /opt/rh/gcc-toolset-11/enable
+          fi
+
+          ATS_FLAGS="
+            -DENABLE_EXPERIMENTAL_PLUGINS=ON
+            -DENABLE_HWLOC=ON
+            -DENABLE_SYSTEM_STATS=ON
+            -DENABLE_RATE_LIMIT=ON
+            -DENABLE_REDO_CACHE_LOOKUP=ON
+            -DENABLE_MONEY_TRACE=ON
+            -DENABLE_MAXMIND_ACL=ON
+            -DENABLE_HTTP_STATS=ON
+            -DENABLE_FQ_PACING=ON
+            -DENABLE_ACCESS_CONTROL=ON
+            -DENABLE_BLOCK_ERRORS=ON
+            -DENABLE_TXN_BOX=ON
+          "
+
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/trafficserver \
+            $ATS_FLAGS \
+            -GNinja
+
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Show built version
+        shell: bash
+        run: |
+          set -euo pipefail
+          /opt/trafficserver/bin/traffic_server --version || true
+
+      - name: Create RPM spec
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version | awk '{print $4}')
+          RELEASE="${{ inputs.build_release }}"
+          HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
+
+          cat > ~/rpmbuild/SPECS/trafficserver.spec <<EOF
+          Name:           trafficserver
+          Version:        ${VERSION}
+          Release:        ${RELEASE}%{?dist}
+          Summary:        Apache Traffic Server
+
+          License:        Apache-2.0
+          URL:            https://trafficserver.apache.org/
+          BuildArch:      x86_64
+          %global git_commit ${HASH}
+
+          %description
+          Apache Traffic Server built from source.
+          Git commit: %{git_commit}
+
+          %prep
+
+          %build
+
+          %install
+          mkdir -p %{buildroot}/opt
+          cp -a /opt/trafficserver %{buildroot}/opt/
+
+          mkdir -p %{buildroot}/var/log/trafficserver
+          mkdir -p %{buildroot}/var/cache/trafficserver
+
+          mkdir -p %{buildroot}/usr/lib/systemd/system
+          cat > %{buildroot}/usr/lib/systemd/system/trafficserver.service <<'SERVICE'
+          [Unit]
+          Description=Apache Traffic Server
+          After=network.target
+
+          [Service]
+          Type=forking
+          ExecStart=/opt/trafficserver/bin/trafficserver start
+          ExecStop=/opt/trafficserver/bin/trafficserver stop
+          ExecReload=/bin/sh -c '/bin/kill -HUP $MAINPID || /opt/trafficserver/bin/trafficserver restart'
+          PIDFile=/opt/trafficserver/var/trafficserver/server.lock
+          User=trafficserver
+          Group=trafficserver
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=100000
+          NoNewPrivileges=true
+          PrivateTmp=true
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          %pre
+          getent group trafficserver >/dev/null || groupadd -r trafficserver
+          getent passwd trafficserver >/dev/null || useradd -r -g trafficserver -d /var/cache/trafficserver -s /sbin/nologin trafficserver
+
+          %post
+          systemctl daemon-reload || true
+          systemctl enable trafficserver || true
+
+          %preun
+          if [ \$1 -eq 0 ]; then
+            systemctl stop trafficserver || true
+            systemctl disable trafficserver || true
+          fi
+
+          %postun
+          systemctl daemon-reload || true
+
+          %files
+          /opt/trafficserver
+          /var/log/trafficserver
+          /var/cache/trafficserver
+          /usr/lib/systemd/system/trafficserver.service
+
+          %changelog
+          * $(date +"%a %b %d %Y") CI Build
+          - Automated build from commit ${HASH}
+          EOF
+
+      - name: Build RPM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rpmbuild -bb ~/rpmbuild/SPECS/trafficserver.spec \
+            --define "_topdir $HOME/rpmbuild"
+
+      - name: Rename RPM
+        id: rpm_name
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=$(/opt/trafficserver/bin/traffic_server --version | awk '{print $4}')
+          RELEASE="${{ inputs.build_release }}"
+          HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
+          ROCKY="${{ matrix.rocky }}"
+          ARCH=$(uname -m)
+
+          FILE=$(find ~/rpmbuild/RPMS -type f -name "*.rpm" ! -name "*debuginfo*" | head -n1)
+          NEW="trafficserver-${VERSION}-${RELEASE}.${HASH}.el${ROCKY}.${ARCH}.rpm"
+
+          cp "$FILE" "$NEW"
+
+          echo "name=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.rpm_name.outputs.name }}
+          path: ${{ steps.rpm_name.outputs.name }}

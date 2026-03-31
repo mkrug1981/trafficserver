@@ -1,4 +1,4 @@
-name: Build Apache Traffic Server RPM v8
+name: Build Apache Traffic Server RPM
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -9,7 +9,7 @@ on:
       ats_branch:
         description: "Branch in mkrug1981/trafficserver"
         required: true
-        default: "10.1.x"
+        default: "11-dev"
         type: string
       rocky_versions:
         description: "Rocky Linux versions (comma-separated: 8,9,10)"
@@ -69,7 +69,6 @@ jobs:
 
           dnf install -y dnf-plugins-core epel-release
 
-          # Rocky 8: upgrade Ruby so Gem/FPM-compatible tooling works
           if [ "$ROCKY" = "8" ]; then
             dnf module enable -y ruby:3.0
             dnf install -y ruby ruby-devel
@@ -120,7 +119,6 @@ jobs:
           dnf config-manager --set-enabled devel 2>/dev/null || true
           dnf groupinstall -y "Development Tools"
 
-          # Rocky 8: modern GCC for ATS 11 / C++20
           if [ "$ROCKY" = "8" ]; then
             dnf install -y gcc-toolset-11 gcc-toolset-11-gcc-c++
           fi
@@ -133,14 +131,11 @@ jobs:
             automake libtool libmaxminddb-devel luajit-devel jansson-devel \
             brotli-devel systemd-rpm-macros"
 
-          # Rocky 10: pcre-devel is deprecated/removed
           if [ "$ROCKY" != "10" ]; then
             DEPS="$DEPS pcre-devel"
           fi
 
           dnf install -y $DEPS
-
-          # Optional deps
           dnf install -y liburing-devel 2>/dev/null || true
           dnf install -y yaml-cpp-devel 2>/dev/null || true
 
@@ -151,7 +146,6 @@ jobs:
 
           cd trafficserver
 
-          # Rocky 8: enable newer GCC in this step
           if [ "${{ matrix.rocky }}" = "8" ]; then
             source /opt/rh/gcc-toolset-11/enable
           fi
@@ -198,16 +192,16 @@ jobs:
           HASH=$(cd trafficserver && git rev-parse --short=10 HEAD)
           DATE_STR=$(date +"%a %b %d %Y")
 
-          cat > ~/rpmbuild/SPECS/trafficserver.spec <<EOF
+          cat > ~/rpmbuild/SPECS/trafficserver.spec <<'EOF'
           Name:           trafficserver
-          Version:        ${VERSION}
-          Release:        ${RELEASE}%{?dist}
+          Version:        __VERSION__
+          Release:        __RELEASE__%{?dist}
           Summary:        Apache Traffic Server
 
           License:        Apache-2.0
           URL:            https://trafficserver.apache.org/
           BuildArch:      x86_64
-          %global git_commit ${HASH}
+          %global git_commit __HASH__
 
           %description
           Apache Traffic Server built from source.
@@ -258,7 +252,7 @@ jobs:
           systemctl enable trafficserver || true
 
           %preun
-          if [ \$1 -eq 0 ]; then
+          if [ $1 -eq 0 ]; then
             systemctl stop trafficserver || true
             systemctl disable trafficserver || true
           fi
@@ -273,9 +267,14 @@ jobs:
           /usr/lib/systemd/system/trafficserver.service
 
           %changelog
-          * ${DATE_STR} CI Build
-          - Automated build from commit ${HASH}
+          * __DATE__ CI Build
+          - Automated build from commit __HASH__
           EOF
+
+          sed -i "s|__VERSION__|$VERSION|g" ~/rpmbuild/SPECS/trafficserver.spec
+          sed -i "s|__RELEASE__|$RELEASE|g" ~/rpmbuild/SPECS/trafficserver.spec
+          sed -i "s|__HASH__|$HASH|g" ~/rpmbuild/SPECS/trafficserver.spec
+          sed -i "s|__DATE__|$DATE_STR|g" ~/rpmbuild/SPECS/trafficserver.spec
 
           echo "Generated spec:"
           sed -n '1,220p' ~/rpmbuild/SPECS/trafficserver.spec

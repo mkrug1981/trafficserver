@@ -74,7 +74,7 @@ jobs:
             dnf install -y ruby ruby-devel
           fi
 
-          dnf install -y git wget jq rpm-build gcc make which file tar gzip
+          dnf install -y git wget jq rpm-build gcc make which file tar gzip python3
 
       - name: Clone Repository
         shell: bash
@@ -137,10 +137,24 @@ jobs:
           * __DATE__ Test
           EOF
 
-          sed -i "s|__VERSION__|$VERSION|g" ~/rpmbuild/SPECS/trafficserver.spec
-          sed -i "s|__RELEASE__|$RELEASE|g" ~/rpmbuild/SPECS/trafficserver.spec
-          sed -i "s|__HASH__|$HASH|g" ~/rpmbuild/SPECS/trafficserver.spec
-          sed -i "s|__DATE__|$DATE_STR|g" ~/rpmbuild/SPECS/trafficserver.spec
+          python3 - <<PY
+          from pathlib import Path
+
+          spec = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
+          text = spec.read_text()
+
+          replacements = {
+              "__VERSION__": """$VERSION""".strip(),
+              "__RELEASE__": """$RELEASE""".strip(),
+              "__HASH__": """$HASH""".strip(),
+              "__DATE__": """$DATE_STR""".strip(),
+          }
+
+          for k, v in replacements.items():
+              text = text.replace(k, v)
+
+          spec.write_text(text)
+          PY
 
           echo "==== TEST SPEC FILE ===="
           cat ~/rpmbuild/SPECS/trafficserver.spec
@@ -313,10 +327,27 @@ jobs:
           - Automated build from commit __HASH__
           EOF
 
-          sed -i "s|__VERSION__|$VERSION|g" ~/rpmbuild/SPECS/trafficserver.spec
-          sed -i "s|__RELEASE__|$RELEASE|g" ~/rpmbuild/SPECS/trafficserver.spec
-          sed -i "s|__HASH__|$HASH|g" ~/rpmbuild/SPECS/trafficserver.spec
-          sed -i "s|__DATE__|$DATE_STR|g" ~/rpmbuild/SPECS/trafficserver.spec
+          python3 - <<PY
+          from pathlib import Path
+
+          spec = Path.home() / "rpmbuild" / "SPECS" / "trafficserver.spec"
+          text = spec.read_text()
+
+          printf 'VERSION=[%s]\nRELEASE=[%s]\nHASH=[%s]\nDATE=[%s]\n' \
+            "$VERSION" "$RELEASE" "$HASH" "$DATE_STR"
+        
+          replacements = {
+              "__VERSION__": """$VERSION""".strip(),
+              "__RELEASE__": """$RELEASE""".strip(),
+              "__HASH__": """$HASH""".strip(),
+              "__DATE__": """$DATE_STR""".strip(),
+          }
+
+          for k, v in replacements.items():
+              text = text.replace(k, v)
+
+          spec.write_text(text)
+          PY
 
           echo "Generated spec:"
           sed -n '1,220p' ~/rpmbuild/SPECS/trafficserver.spec

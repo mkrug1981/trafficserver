@@ -52,7 +52,7 @@ jobs:
 
     runs-on: ubuntu-latest
     container:
-      image: rockylinux:${{ matrix.rocky }}
+      image: rockylinux/rockylinux:${{ matrix.rocky }}
 
     steps:
       - name: Install Base Tools
